@@ -1,0 +1,131 @@
+version: "3.9"
+
+services:
+  # ── Postgres ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hairstyle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hairstyle_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-hairstyle_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hairstyle}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── MinIO (S3-compatible object store for uploads) ────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── LocalStack (SQS) ─────────────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+      DEBUG: 0
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      LOCALSTACK_DOCKER_NAME: localstack
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./infra/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── MinIO bucket init ─────────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin};
+        mc mb --ignore-existing local/${MINIO_BUCKET_UPLOADS:-hairstyle-uploads};
+        mc mb --ignore-existing local/${MINIO_BUCKET_RESULTS:-hairstyle-results};
+        mc mb --ignore-existing local/hairstyle-model-cache;
+        mc mb --ignore-existing local/hairstyle-references;
+        echo 'MinIO buckets ready';
+      "
+    restart: "no"
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hairstyle}:${POSTGRES_PASSWORD:-hairstyle_secret}@postgres:5432/${POSTGRES_DB:-hairstyle_db}
+      DATABASE_SYNC_URL: postgresql://${POSTGRES_USER:-hairstyle}:${POSTGRES_PASSWORD:-hairstyle_secret}@postgres:5432/${POSTGRES_DB:-hairstyle_db}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── GPU Worker ────────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hairstyle}:${POSTGRES_PASSWORD:-hairstyle_secret}@postgres:5432/${POSTGRES_DB:-hairstyle_db}
+      DATABASE_SYNC_URL: postgresql://${POSTGRES_USER:-hairstyle}:${POSTGRES_PASSWORD:-hairstyle_secret}@postgres:5432/${POSTGRES_DB:-hairstyle_db}
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Comment out the deploy section if no GPU is available locally
+
+volumes:
+  postgres_data:
+  minio_data:
+  localstack_data:
